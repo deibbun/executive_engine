@@ -1,0 +1,17 @@
+# Python compilation junk
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local database files
+*.db
+bot_trading.db
+
+# Sensitive configurations and wallets
+config.json
+wallet.json
+
+# Environment / Secret files
+.env
+secrets.py
