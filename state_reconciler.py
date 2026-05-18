@@ -17,16 +17,30 @@ class StateReconciler:
     def __init__(self, config_path='wallet.json'):
         self.config_path = config_path
         self.logger = logging.getLogger("ExecutiveEngine.Reconciler")
-
+        
     def get_total_balance(self):
-        """Reads the total USD balance from the config file."""
+        """Reads the total USD balance directly from the PostgreSQL master account table."""
+        conn = None
         try:
-            with open(self.config_path, 'r') as f:
-                data = json.load(f)
-                return Decimal(str(data['balances']['USD']))
-        except Exception as e:
-            self.logger.error(f"Error reading {self.config_path}: {e}")
+            conn = psycopg2.connect(**DB_CONFIG)
+            cursor = conn.cursor()
+            
+            # Fetch the live cash pool from the database
+            cursor.execute("SELECT liquid_usd FROM account_balance WHERE account_id = 1;")
+            result = cursor.fetchone()
+            
+            cursor.close()
+            
+            if result:
+                return Decimal(str(result[0]))
             return Decimal("0.00")
+            
+        except Exception as e:
+            self.logger.error(f"Database error reading balance: {e}")
+            return Decimal("0.00")
+        finally:
+            if conn:
+                conn.close()
 
     def get_reserved_funds(self):
         """
