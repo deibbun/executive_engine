@@ -48,6 +48,10 @@ def run_engine():
             logger.info(f"--- Cycle Update ---")
             logger.info(f"Liquid Pool: ${liquid_pool}")
             
+            # 🛡️ RISK DIAL: Dynamically adjust trade sizing based on recent performance
+            current_risk_pct = funding.calculate_drawdown_governor(db_conn, base_risk=0.02, floor_risk=0.005)
+            logger.info(f"[RISK CONTROL] Active Sizing Profile: {current_risk_pct * 100:.2f}% risk per asset allocation.")
+            
             # 📊 PAIRS TRADING: Calculate spreads against the Market Leader (BTC)
             leader = 'BTC/USD'
             laggards = ['ETH/USD', 'SOL/USD']
@@ -104,7 +108,7 @@ def run_engine():
                     if active_signals[symbol].get('momentum_ignition'):
                         logger.warning(f"🚨 [MOMENTUM IGNITION] Massive volume breakout detected on {symbol}! Executing 100% allocation market buy.")
                         
-                        target_usd = liquid_cash * 0.02 # Full 2% risk allocation
+                        target_usd = liquid_cash * current_risk_pct # Full 2% risk allocation
                         qty = target_usd / float(current_price)
                         
                         try:
@@ -135,7 +139,7 @@ def run_engine():
                     else:
                         logger.info(f"  > Signal Triggered! Calculating Volatility-Adjusted Tranches for {symbol}...")
                         vol_mult = float(active_signals[symbol]['vol_multiplier'])
-                        order_plan = calculate_tranche_orders(symbol, liquid_cash, float(current_price), vol_mult, risk_pct=0.02)
+                        order_plan = calculate_tranche_orders(symbol, liquid_cash, float(current_price), vol_mult, risk_pct=current_risk_pct)
                         
                         if order_plan['status'] == 'APPROVED':
                             t1 = order_plan['orders'][0]

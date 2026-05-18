@@ -55,3 +55,51 @@ class FundingManager:
                 allocations[symbol] = Decimal("0.00")
                 
         return allocations
+        
+    def calculate_drawdown_governor(self, db_conn, base_risk: float = 0.02, floor_risk: float = 0.005) -> float:
+        """
+        Queries equity snapshots to compute the active peak-to-trough drawdown.
+        Dials down risk allocation linearly as drawdown increases to preserve capital.
+        """
+        try:
+            cursor = db_conn.cursor()
+            
+            # 1. Fetch the latest net worth using your exact schema column names
+            cursor.execute("SELECT total_net_worth_usd FROM equity_snapshots ORDER BY snapshot_time DESC LIMIT 1;")
+            latest_res = cursor.fetchone()
+            
+            # 2. Fetch the highest historical net worth ever achieved
+            cursor.execute("SELECT MAX(total_net_worth_usd) FROM equity_snapshots;")
+            peak_res = cursor.fetchone()
+            
+            cursor.close()
+            
+            if not latest_res or not peak_res or not peak_res[0]:
+                return base_risk
+                
+            current_equity = float(latest_res[0])
+            peak_equity = float(peak_res[0])
+            
+            if peak_equity <= 0:
+                return base_risk
+                
+            # 3. Calculate Peak-to-Trough Drawdown Percentage
+            drawdown_pct = ((peak_equity - current_equity) / peak_equity) * 100
+            
+            if drawdown_pct <= 0:
+                return base_risk
+                
+            # 4. THE RISK DIAL: Reduce risk by 0.1% for every 1% of account drawdown
+            reduction = (drawdown_pct * 0.1) / 100
+            dynamic_risk = base_risk - reduction
+            
+            # Clamp the output between the absolute floor and the maximum base risk
+            final_risk = max(floor_risk, min(base_risk, dynamic_risk))
+            
+            return final_risk
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating drawdown governor: {e}")
+            # 🛡️ Roll back the aborted transaction block to clear the connection lock
+            db_conn.rollback()
+            return base_risk
