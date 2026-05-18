@@ -48,6 +48,27 @@ def run_engine():
             logger.info(f"--- Cycle Update ---")
             logger.info(f"Liquid Pool: ${liquid_pool}")
             
+            # 📊 PAIRS TRADING: Calculate spreads against the Market Leader (BTC)
+            leader = 'BTC/USD'
+            laggards = ['ETH/USD', 'SOL/USD']
+            
+            for laggard in laggards:
+                spread_data = scanner.calculate_pairs_spread(leader, laggard, lookback_hours=24)
+                
+                if spread_data['status'] == 'SUCCESS':
+                    gap = spread_data['spread']
+                    logger.info(f"[PAIRS SPREAD] {leader}: {spread_data['leader_pct']}% | {laggard}: {spread_data['laggard_pct']}% | Gap: {gap}%")
+
+                    # ⚡ THE ARBITRAGE TRIGGER
+                    if gap >= 4.0:
+                        logger.warning(f"🚨 [ARBITRAGE ALERT] 24H Gap is {gap}%! Forcing {laggard} into HUNTING mode.")
+                        
+                        # Override the standard SMA rules for this specific lagging coin
+                        active_signals[laggard]['is_hunting'] = True
+                        
+            # Recalculate the capital slices once, after checking all pairs
+            allocations = funding.allocate(total_balance, reserved_dict, active_signals)
+            
             # Create a quick dictionary of the live prices for our sweepers
             live_prices = {sym: data['price'] for sym, data in active_signals.items()}
             
@@ -57,6 +78,10 @@ def run_engine():
             
             for symbol, data in active_signals.items():
                 status = "HUNTING" if data['is_hunting'] else "WAITING"
+                
+                # Add a visual flag if the momentum engine detects an explosion
+                momentum_flag = " 🚀 BREAKOUT!" if data.get('momentum_ignition') else ""
+                
                 logger.info(f"[{symbol}] Price: ${data['price']} | SMA: ${data['sma']} | Vol Multiplier: {data['vol_multiplier']}x | {status}")
                 
             # COMPREHENSIVE EXECUTION LOOP (ENTRIES & EXITS)
@@ -75,50 +100,79 @@ def run_engine():
                     
                     liquid_cash = float(liquid_pool) 
                     
-                    # 1. Pass the live volatility multiplier into the math!
-                    vol_mult = float(active_signals[symbol]['vol_multiplier'])
-                    order_plan = calculate_tranche_orders(symbol, liquid_cash, current_price, vol_mult, risk_pct=0.02)
-                    
-                    if order_plan['status'] == 'APPROVED':
-                        # Extract Tranche 1 (The immediate Market Buy)
-                        t1 = order_plan['orders'][0]
-                        target_qty = t1['qty']
-                        total_cost = t1['usd_size']
+                    # 🚀 PATH A: THE MOMENTUM BREAKOUT (100% Allocation)
+                    if active_signals[symbol].get('momentum_ignition'):
+                        logger.warning(f"🚨 [MOMENTUM IGNITION] Massive volume breakout detected on {symbol}! Executing 100% allocation market buy.")
+                        
+                        target_usd = liquid_cash * 0.02 # Full 2% risk allocation
+                        qty = target_usd / float(current_price)
                         
                         try:
                             cursor = db_conn.cursor()
-                            
-                            # Execute Tranche 1 into the database
                             cursor.execute("""
                                 UPDATE positions 
                                 SET status = 'OPEN', qty = %s, entry_price = %s, 
                                     initial_margin_usd = %s, last_updated = CURRENT_TIMESTAMP
                                 WHERE symbol = %s;
-                            """, (target_qty, current_price, total_cost, symbol))
+                            """, (qty, current_price, target_usd, symbol))
                             
                             cursor.execute("""
                                 UPDATE account_balance 
                                 SET liquid_usd = liquid_usd - %s 
                                 WHERE account_id = 1;
-                            """, (total_cost,))
+                            """, (target_usd,))
                             
                             db_conn.commit()
-                            logger.info(f"  [TRANCHE 1 EXECUTED] Bought {target_qty} {symbol} at ${current_price:,.2f} (Cost: ${total_cost:,.2f})")
-                            
-                            # Log the dynamic pending limit orders for Tranche 2 and 3
-                            t2 = order_plan['orders'][1]
-                            t3 = order_plan['orders'][2]
-                            logger.info(f"  [PENDING LIMIT] Tranche 2 mapped at ${t2['target_price']:,.2f} (-{t2['drop_pct']}%)")
-                            logger.info(f"  [PENDING LIMIT] Tranche 3 mapped at ${t3['target_price']:,.2f} (-{t3['drop_pct']}%)")
-                            
+                            logger.info(f"  [BREAKOUT EXECUTED] Bought {qty:.6f} {symbol} at ${current_price:,.2f} (Cost: ${target_usd:,.2f})")
+                            executor.execute_paper_order(symbol, 'BUY', current_price, qty)
                         except Exception as e:
                             db_conn.rollback()
-                            logger.error(f"  [DB ERROR] Failed to lock in paper trade for {symbol}: {e}")
+                            logger.error(f"  [DB ERROR] Failed to lock in momentum trade for {symbol}: {e}")
                         finally:
                             cursor.close()
-            
+
+                    # 📉 PATH B: STANDARD VOLATILITY TRANCHES (3-Part Ladder)
                     else:
-                        logger.info(f"  [RISK MANAGER] Buy aborted for {symbol}: {order_plan.get('reason')}")
+                        logger.info(f"  > Signal Triggered! Calculating Volatility-Adjusted Tranches for {symbol}...")
+                        vol_mult = float(active_signals[symbol]['vol_multiplier'])
+                        order_plan = calculate_tranche_orders(symbol, liquid_cash, float(current_price), vol_mult, risk_pct=0.02)
+                        
+                        if order_plan['status'] == 'APPROVED':
+                            t1 = order_plan['orders'][0]
+                            target_qty = t1['qty']
+                            total_cost = t1['usd_size']
+                            
+                            try:
+                                cursor = db_conn.cursor()
+                                cursor.execute("""
+                                    UPDATE positions 
+                                    SET status = 'OPEN', qty = %s, entry_price = %s, 
+                                        initial_margin_usd = %s, last_updated = CURRENT_TIMESTAMP
+                                    WHERE symbol = %s;
+                                """, (target_qty, current_price, total_cost, symbol))
+                                
+                                cursor.execute("""
+                                    UPDATE account_balance 
+                                    SET liquid_usd = liquid_usd - %s 
+                                    WHERE account_id = 1;
+                                """, (total_cost,))
+                                
+                                db_conn.commit()
+                                logger.info(f"  [TRANCHE 1 EXECUTED] Bought {target_qty:.6f} {symbol} at ${current_price:,.2f} (Cost: ${total_cost:,.2f})")
+                                executor.execute_paper_order(symbol, 'BUY', current_price, target_qty)
+                                
+                                t2 = order_plan['orders'][1]
+                                t3 = order_plan['orders'][2]
+                                logger.info(f"  [PENDING LIMIT] Tranche 2 mapped at ${t2['target_price']:,.2f} (-{t2['drop_pct']}%)")
+                                logger.info(f"  [PENDING LIMIT] Tranche 3 mapped at ${t3['target_price']:,.2f} (-{t3['drop_pct']}%)")
+                                
+                            except Exception as e:
+                                db_conn.rollback()
+                                logger.error(f"  [DB ERROR] Failed to lock in paper trade for {symbol}: {e}")
+                            finally:
+                                cursor.close()
+                        else:
+                            logger.info(f"  [RISK MANAGER] Buy aborted for {symbol}: {order_plan.get('reason')}")
                 
                 # Case 2: Strategy drops allocation to 0, but we are still holding the asset
                 elif usd_allocation == 0 and is_holding:
@@ -139,7 +193,7 @@ def run_engine():
                 net_worth = record_equity_snapshot(db_conn, float(liquid_pool), live_prices)
                 
                 if net_worth > 0:
-                    logger.info(f"\n[🕒 HOURLY LEDGER] Snapshot secured.  Total Network Equity:  ${net_worth:,.2f}\n")
+                    logger.info(f"[🕒 HOURLY LEDGER] Snapshot secured.  Total Network Equity:  ${net_worth:,.2f}")
                     
                 last_snapshot_hour = current_time.hour
 

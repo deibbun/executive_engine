@@ -48,9 +48,30 @@ class MarketScanner:
                 
                 # Assuming 1.0% hourly movement is "normal baseline volatility"
                 # If ATR is 2.5%, the multiplier becomes 2.5
-                vol_multiplier = max(Decimal("1.0"), atr_pct) 
+                vol_multiplier = max(Decimal("1.0"), atr_pct)
                 
-                is_hunting = current_price > current_sma
+                # ---------------------------------------------------------
+                # 🚀 NEW: MOMENTUM & BREAKOUT MATH
+                # ---------------------------------------------------------
+                # 1. Find the highest price of the last 24 hours (excluding the current unclosed hour)
+                rolling_24h_high = df['high'].iloc[-25:-1].max()
+                
+                # 2. Calculate the average volume over the last 24 hours
+                avg_24h_volume = df['volume'].iloc[-25:-1].mean()
+                current_volume = latest['volume']
+                
+                # 3. Detect if volume is exploding (e.g., 2.5x higher than normal)
+                volume_spike = current_volume > (avg_24h_volume * 2.5)
+                
+                # 4. Detect if price is breaking through the 24h ceiling
+                is_breaking_out = float(current_price) > rolling_24h_high
+                
+                # The Ultimate Momentum Trigger: Breaking resistance WITH massive volume
+                momentum_ignition = is_breaking_out and volume_spike
+                # ---------------------------------------------------------
+
+                # 5. The Whipsaw Defense (Standard SMA Strategy)
+                is_hunting = (current_price > current_sma) and (atr_pct > Decimal("0.5"))
                 
                 signals[symbol] = {
                     'price': current_price.quantize(Decimal("0.01")),
@@ -64,3 +85,44 @@ class MarketScanner:
                 signals[symbol] = {'price': Decimal("0"), 'sma': Decimal("0"), 'atr_pct': Decimal("0"), 'vol_multiplier': Decimal("1"), 'is_hunting': False}
                 
         return signals
+        
+    def calculate_pairs_spread(self, leader_symbol='BTC/USD', laggard_symbol='SOL/USD', lookback_hours=24) -> dict:
+        """
+        Calculates the 24-hour performance gap between two correlated assets.
+        Returns the spread data to determine if the 'rubber band' is stretched.
+        """
+        try:
+            # Fetch 24 hours of data for both coins
+            leader_ohlcv = self.exchange.fetch_ohlcv(leader_symbol, timeframe='1h', limit=lookback_hours)
+            laggard_ohlcv = self.exchange.fetch_ohlcv(laggard_symbol, timeframe='1h', limit=lookback_hours)
+            
+            if not leader_ohlcv or not laggard_ohlcv:
+                return {"status": "ERROR", "reason": "Missing data"}
+
+            # Calculate Leader Returns (e.g., Bitcoin)
+            leader_start_price = float(leader_ohlcv[0][1]) # Open price 24h ago
+            leader_current_price = float(leader_ohlcv[-1][4]) # Current Close price
+            leader_pct_change = ((leader_current_price - leader_start_price) / leader_start_price) * 100
+
+            # Calculate Laggard Returns (e.g., Solana)
+            laggard_start_price = float(laggard_ohlcv[0][1])
+            laggard_current_price = float(laggard_ohlcv[-1][4])
+            laggard_pct_change = ((laggard_current_price - laggard_start_price) / laggard_start_price) * 100
+
+            # Calculate the "Rubber Band" Spread
+            # If BTC is up 5% and SOL is down 1%, the spread is 6.0%
+            spread = leader_pct_change - laggard_pct_change
+
+            return {
+                "status": "SUCCESS",
+                "leader": leader_symbol,
+                "laggard": laggard_symbol,
+                "leader_pct": round(leader_pct_change, 2),
+                "laggard_pct": round(laggard_pct_change, 2),
+                "spread": round(spread, 2),
+                "laggard_current_price": laggard_current_price
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error calculating pairs spread: {e}")
+            return {"status": "ERROR"}
