@@ -42,10 +42,10 @@ class StateReconciler:
             if conn:
                 conn.close()
 
-    def get_reserved_funds(self):
+    def get_reserved_funds(self, strategy_id='master'):
         """
         Calculates locked USD for pending T2 and T3 tranches 
-        based on active 'HOLDING' positions in PostgreSQL.
+        ISOLATED by a specific strategy_id.
         """
         reserved = {
             'BTC/USD': Decimal("0.00"),
@@ -56,10 +56,15 @@ class StateReconciler:
         conn = None
         try:
             conn = psycopg2.connect(**DB_CONFIG)
-            # RealDictCursor keeps your row['column_name'] syntax working perfectly
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
-            cursor.execute("SELECT symbol, tranche_level, trade_size FROM bot_state WHERE status = 'HOLDING'")
+            # 🛡️ STRATEGY ISOLATION: Filter by the running strategy instance
+            query = """
+                SELECT symbol, tranche_level, trade_size 
+                FROM bot_state 
+                WHERE status = 'HOLDING' AND strategy_id = %s
+            """
+            cursor.execute(query, (strategy_id,))
             rows = cursor.fetchall()
             
             for row in rows:
@@ -81,9 +86,41 @@ class StateReconciler:
 
             cursor.close()
         except Exception as e:
-            self.logger.error(f"Database error in Reconciler: {e}")
+            self.logger.error(f"Database error in Reconciler for strategy '{strategy_id}': {e}")
         finally:
             if conn:
                 conn.close()
                 
         return reserved
+
+    def get_all_global_reserved(self):
+        """
+        Calculates the absolute total of ALL reserved funds across ALL strategies.
+        This ensures the funding manager knows exactly what cash is truly untouchable.
+        """
+        conn = None
+        total_reserved = Decimal("0.00")
+        try:
+            conn = psycopg2.connect(**DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            cursor.execute("SELECT tranche_level, trade_size FROM bot_state WHERE status = 'HOLDING'")
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                tranche_level = int(row['tranche_level'])
+                current_size = Decimal(str(row['trade_size']))
+                
+                if tranche_level == 1:
+                    total_reserved += (current_size / Decimal("0.30")) * Decimal("0.70")
+                elif tranche_level == 2:
+                    total_reserved += (current_size / Decimal("0.60")) * Decimal("0.40")
+                    
+            cursor.close()
+        except Exception as e:
+            self.logger.error(f"Database error calculating global reserved funds: {e}")
+        finally:
+            if conn:
+                conn.close()
+                
+        return total_reserved.quantize(Decimal("0.01"))

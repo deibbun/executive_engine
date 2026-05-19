@@ -62,9 +62,11 @@ class MarketScanner:
                 
                 # 3. Detect if volume is exploding (e.g., 2.5x higher than normal)
                 volume_spike = current_volume > (avg_24h_volume * 2.5)
+                #volume_spike = True
                 
                 # 4. Detect if price is breaking through the 24h ceiling
                 is_breaking_out = float(current_price) > rolling_24h_high
+                #is_breaking_out = True
                 
                 # The Ultimate Momentum Trigger: Breaking resistance WITH massive volume
                 momentum_ignition = is_breaking_out and volume_spike

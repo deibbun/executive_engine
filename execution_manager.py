@@ -113,9 +113,12 @@ class ExecutionManager:
 
     def execute_paper_order(self, symbol, side, price, amount):
         """Simulates an exchange execution and logs it into PostgreSQL."""
-        total_usd = price * amount
-        
         try:
+            # 🛡️ Cast both inputs to float immediately to neutralize Decimal vs Float conflicts
+            f_price = float(price)
+            f_amount = float(amount)
+            total_usd = f_price * f_amount
+            
             conn = psycopg2.connect(**self.db_params)
             cur = conn.cursor()
             
@@ -123,10 +126,10 @@ class ExecutionManager:
                 INSERT INTO paper_trades (symbol, side, price, amount, total_usd)
                 VALUES (%s, %s, %s, %s, %s);
             """
-            cur.execute(query, (symbol, side, float(price), float(amount), float(total_usd)))
+            cur.execute(query, (symbol, side, f_price, f_amount, float(total_usd)))
             conn.commit()
             
-            self.logger.info(f"[PAPER TRADE] Successfully executed {side} for {amount:.6f} {symbol} at ${price:.2f} (Total: ${total_usd:.2f})")
+            self.logger.info(f"[PAPER TRADE] Successfully executed {side} for {f_amount:.6f} {symbol} at ${f_price:.2f} (Total: ${total_usd:.2f})")
             
             cur.close()
             conn.close()

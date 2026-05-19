@@ -65,6 +65,7 @@ def run_engine():
 
                     # ⚡ THE ARBITRAGE TRIGGER
                     if gap >= 4.0:
+                    #if gap >= 0.5:
                         logger.warning(f"🚨 [ARBITRAGE ALERT] 24H Gap is {gap}%! Forcing {laggard} into HUNTING mode.")
                         
                         # Override the standard SMA rules for this specific lagging coin
@@ -98,8 +99,16 @@ def run_engine():
                 sma = active_signals[symbol]['sma']
                 position_status = "HUNTING" if active_signals[symbol]['is_hunting'] else "WAITING"
                 
+                #=================================================================================================================
+                # 🔍 TEMPORARY DIAGNOSTIC
+                if symbol in ['ETH/USD', 'SOL/USD']:
+                    logger.info(f"[DIAGNOSTIC] {symbol} | is_hunting: {active_signals[symbol]['is_hunting']} | DB Status: {position_status}")
+                #===========================================================================================================
+                
                 # Case 1: Strategy wants to buy, and we don't have a position yet
-                if current_price > sma and position_status == 'WAITING':
+                #if current_price > sma and position_status == 'WAITING':
+                #if active_signals[symbol]['is_hunting'] and position_status in ['WAITING', 'HUNTING']:
+                if active_signals[symbol]['is_hunting'] and position_status == 'WAITING':
                     logger.info(f"  > Signal Triggered! Calculating Volatility-Adjusted Tranches for {symbol}...")
                     
                     liquid_cash = float(liquid_pool) 
@@ -163,7 +172,18 @@ def run_engine():
                                 
                                 db_conn.commit()
                                 logger.info(f"  [TRANCHE 1 EXECUTED] Bought {target_qty:.6f} {symbol} at ${current_price:,.2f} (Cost: ${total_cost:,.2f})")
-                                executor.execute_paper_order(symbol, 'BUY', current_price, target_qty)
+                                success = executor.execute_paper_order(symbol, 'BUY', current_price, target_qty)
+                                
+                                if success:
+                                    # 🛡️ THE FIX:  Advance state to OPEN so it stops stacking Tranche 1 orders!
+                                    cursor = db_conn.cursor()
+                                    cursor.execute(
+                                        "UPDATE positions SET status = 'OPEN', entry_price = %s, qty = %s WHERE symbol = %s",
+                                        (float(current_price), float(target_qty), symbol)
+                                    )
+                                    db_conn.commit()
+                                    cursor.close()
+                                    logger.info(f"🔒  [STATE ADVANCE] {symbol} moved to OPEN.  Buying gate locked.")
                                 
                                 t2 = order_plan['orders'][1]
                                 t3 = order_plan['orders'][2]
