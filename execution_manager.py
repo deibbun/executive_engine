@@ -14,13 +14,11 @@ def calculate_tranche_orders(symbol: str, liquid_cash: float, current_price: flo
     Calculates a dynamic 3-part limit order ladder.
     Multiplies base drop thresholds by live market volatility (ATR).
     """
-    # 1. Base rules from your config.json roadmap
-    allocations = [0.30, 0.30, 0.40] # 30%, 30%, 40% capital split
-    base_drops = [0.0, 3.0, 6.0]     # 0%, 3%, 6% drops
+    allocations = [0.30, 0.30, 0.40] 
+    base_drops = [0.0, 3.0, 6.0]     
 
     KRAKEN_MIN_USD = 2.00
     
-    # 2. Total money we are allowing this specific coin to use
     total_target_usd = liquid_cash * risk_pct
     
     if total_target_usd < (KRAKEN_MIN_USD * 3):
@@ -28,18 +26,10 @@ def calculate_tranche_orders(symbol: str, liquid_cash: float, current_price: flo
         
     orders = []
     
-    # 3. Calculate the exact math for all 3 bullets
     for i in range(3):
-        # 🔥 THE MAGIC: Multiply the required price drop by the live volatility!
         dynamic_drop_pct = base_drops[i] * vol_multiplier
-        
-        # Calculate the exact target price where the limit order should sit
         target_price = current_price * (1 - (dynamic_drop_pct / 100))
-        
-        # Calculate how much cash this specific bullet gets
         tranche_usd = total_target_usd * allocations[i]
-        
-        # Calculate exact token quantity
         qty = tranche_usd / target_price
         
         orders.append({
@@ -56,41 +46,39 @@ def calculate_tranche_orders(symbol: str, liquid_cash: float, current_price: flo
         "orders": orders
     }
 
-def record_equity_snapshot(db_conn, liquid_cash: float, current_prices: dict) -> float:
+def record_equity_snapshot(db_conn, liquid_cash: float, current_prices: dict, strategy_id: str = 'master') -> float:
     """
     Calculates the live portfolio net worth and saves an immutable
-    timestamped row to the equity_snapshots ledger.
+    timestamped row to the equity_snapshots ledger, ISOLATED by strategy.
     """
     cursor = db_conn.cursor()
     try:
-        # 1. Fetch only the assets we are currently holding
-        cursor.execute("SELECT symbol, qty FROM positions WHERE status = 'OPEN';")
+        # 🛡️ STRATEGY ISOLATION: Fetch only the assets THIS strategy is holding
+        cursor.execute("SELECT symbol, qty FROM positions WHERE status = 'OPEN' AND strategy_id = %s;", (strategy_id,))
         open_positions = cursor.fetchall()
         
         open_positions_value_usd = 0.0
         
-        # 2. Calculate the exact live USD value of all held crypto tokens
         for symbol, qty in open_positions:
             live_price = current_prices.get(symbol, 0.0)
             open_positions_value_usd += float(qty) * float(live_price)
             
-        # 3. Calculate absolute institutional net worth
         total_net_worth_usd = float(liquid_cash) + open_positions_value_usd
         
-        # 4. Insert the master metrics into the snapshot ledger
+        # 🛡️ STRATEGY ISOLATION: Insert the snapshot explicitly tagged for this bot
         insert_query = """
             INSERT INTO equity_snapshots
-            (available_cash_usd, reserved_cash_usd, open_positions_value_usd, total_net_worth_usd)
-            VALUES (%s, %s, %s, %s);
+            (strategy_id, available_cash_usd, reserved_cash_usd, open_positions_value_usd, total_net_worth_usd)
+            VALUES (%s, %s, %s, %s, %s);
         """
-        cursor.execute(insert_query, (liquid_cash, 0.0, open_positions_value_usd, total_net_worth_usd))
+        cursor.execute(insert_query, (strategy_id, liquid_cash, 0.0, open_positions_value_usd, total_net_worth_usd))
         db_conn.commit()
             
         return total_net_worth_usd
             
     except Exception as e:
         db_conn.rollback()
-        print(f"Database error while recording equity snapshot:  {e}")
+        print(f"Database error while recording equity snapshot for {strategy_id}:  {e}")
         return 0.0
     finally:
         cursor.close()
@@ -100,9 +88,11 @@ def record_equity_snapshot(db_conn, liquid_cash: float, current_prices: dict) ->
 # ==========================================
 
 class ExecutionManager:
-    def __init__(self, db_config=None):
-        self.logger = logging.getLogger("ExecutiveEngine.Execution")
-        # Updated dbname to 'cryptobot'
+    # 🛡️ STRATEGY ISOLATION: Accept strategy_id on initialization
+    def __init__(self, db_config=None, strategy_id='master'):
+        self.strategy_id = strategy_id
+        self.logger = logging.getLogger(f"ExecutiveEngine.Execution.{self.strategy_id.upper()}")
+        
         self.db_params = db_config or {
             'dbname': 'cryptobot',
             'user': 'deibbun',
@@ -114,7 +104,6 @@ class ExecutionManager:
     def execute_paper_order(self, symbol, side, price, amount):
         """Simulates an exchange execution and logs it into PostgreSQL."""
         try:
-            # 🛡️ Cast both inputs to float immediately to neutralize Decimal vs Float conflicts
             f_price = float(price)
             f_amount = float(amount)
             total_usd = f_price * f_amount
@@ -122,11 +111,12 @@ class ExecutionManager:
             conn = psycopg2.connect(**self.db_params)
             cur = conn.cursor()
             
+            # 🛡️ STRATEGY ISOLATION: Tag the receipt
             query = """
-                INSERT INTO paper_trades (symbol, side, price, amount, total_usd)
-                VALUES (%s, %s, %s, %s, %s);
+                INSERT INTO paper_trades (symbol, strategy_id, side, price, amount, total_usd)
+                VALUES (%s, %s, %s, %s, %s, %s);
             """
-            cur.execute(query, (symbol, side, f_price, f_amount, float(total_usd)))
+            cur.execute(query, (symbol, self.strategy_id, side, f_price, f_amount, float(total_usd)))
             conn.commit()
             
             self.logger.info(f"[PAPER TRADE] Successfully executed {side} for {f_amount:.6f} {symbol} at ${f_price:.2f} (Total: ${total_usd:.2f})")
@@ -140,17 +130,17 @@ class ExecutionManager:
             return False
 
     def is_already_holding(self, symbol):
-        """Checks if our last recorded action for this symbol was a BUY."""
+        """Checks if our last recorded action for this symbol AND strategy was a BUY."""
         try:
             conn = psycopg2.connect(**self.db_params)
             cur = conn.cursor()
             
             query = """
                 SELECT side FROM paper_trades 
-                WHERE symbol = %s 
+                WHERE symbol = %s AND strategy_id = %s
                 ORDER BY timestamp DESC LIMIT 1;
             """
-            cur.execute(query, (symbol,))
+            cur.execute(query, (symbol, self.strategy_id))
             result = cur.fetchone()
             
             cur.close()
@@ -165,17 +155,17 @@ class ExecutionManager:
             return False
 
     def get_current_position_amount(self, symbol):
-        """Retrieves the exact amount bought in the last trade so we can liquidate it entirely."""
+        """Retrieves the exact amount bought in the last trade by THIS specific bot."""
         try:
             conn = psycopg2.connect(**self.db_params)
             cur = conn.cursor()
             
             query = """
                 SELECT amount FROM paper_trades 
-                WHERE symbol = %s AND side = 'BUY'
+                WHERE symbol = %s AND side = 'BUY' AND strategy_id = %s
                 ORDER BY timestamp DESC LIMIT 1;
             """
-            cur.execute(query, (symbol,))
+            cur.execute(query, (symbol, self.strategy_id))
             result = cur.fetchone()
             
             cur.close()
@@ -191,25 +181,23 @@ class ExecutionManager:
             
     def enforce_time_stops(self, live_prices: dict, max_hold_hours: int = 72):
         """
-        Scans for open positions older than the allowed holding period.
-        If found, liquidates them at the current market price to free up capital drag.
+        Scans for open positions older than the allowed holding period belonging to THIS bot.
         """
         try:
             conn = psycopg2.connect(**self.db_params)
             cur = conn.cursor()
 
-            # Find positions older than our max_hold_hours threshold
             query = """
                 SELECT symbol, qty, entry_price 
                 FROM positions 
-                WHERE status = 'OPEN' 
+                WHERE status = 'OPEN' AND strategy_id = %s
                 AND last_updated < NOW() - INTERVAL '%s hours';
             """
-            cur.execute(query, (max_hold_hours,))
+            cur.execute(query, (self.strategy_id, max_hold_hours))
             stale_positions = cur.fetchall()
 
             if not stale_positions:
-                return  # No stale positions found, exit silently
+                return  
 
             for pos in stale_positions:
                 symbol, qty, entry_price = pos
@@ -222,17 +210,14 @@ class ExecutionManager:
                 
                 self.logger.warning(f"⏳ [TIME STOP] {symbol} held for > {max_hold_hours} hrs. Liquidating to free capital.")
 
-                # 1. Log the paper trade sell to keep our receipts accurate
                 self.execute_paper_order(symbol, 'SELL', float(current_price), float(qty))
 
-                # 2. Wipe the position from the active board
                 cur.execute("""
                     UPDATE positions 
                     SET status = 'WAITING', qty = 0, entry_price = 0, initial_margin_usd = 0 
-                    WHERE symbol = %s;
-                """, (symbol,))
+                    WHERE symbol = %s AND strategy_id = %s;
+                """, (symbol, self.strategy_id))
 
-                # 3. Inject the salvaged funds back into the master liquid pool
                 cur.execute("""
                     UPDATE account_balance 
                     SET liquid_usd = liquid_usd + %s 
